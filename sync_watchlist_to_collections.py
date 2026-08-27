@@ -1,12 +1,12 @@
 
 #!/usr/bin/env python3
-"""Sync Plex Discover watchlist to local Plex playlists.
+"""Sync Plex Discover watchlist to local Plex collections.
 
 - Reads Plex account watchlist (Discover / Universal Watchlist).
 - Diffs against a cached snapshot from the previous run.
-- Applies incremental updates to two local playlists:
-  * Movies playlist
-  * Shows playlist
+- Applies incremental updates to two local collections in your Plex libraries:
+  * Movies collection
+  * Shows collection
 - Tracks items that exist in Discover but not yet in the local server,
   and adds them once they become available.
 
@@ -25,10 +25,12 @@ from plexapi.server import PlexServer
 
 
 DEFAULT_CACHE_PATH = os.getenv("CACHE_PATH", "/data/plex-watchlist-cache.json")
-DEFAULT_MOVIE_PLAYLIST_NAME = os.getenv("MOVIE_PLAYLIST_NAME", "Movies Watchlist")
-DEFAULT_SHOW_PLAYLIST_NAME = os.getenv("SHOW_PLAYLIST_NAME", "TV Watchlist")
+DEFAULT_MOVIE_COLLECTION_NAME = os.getenv("MOVIE_COLLECTION_NAME", "Plan to Watch (Movies)")
+DEFAULT_SHOW_COLLECTION_NAME = os.getenv("SHOW_COLLECTION_NAME", "Plan to Watch (Shows)")
 DEFAULT_PLEX_BASE_URL = os.getenv("PLEX_BASE_URL", "http://plex:32400")
 DEFAULT_PLEX_TOKEN = os.getenv("PLEX_TOKEN", "")
+DEFAULT_MOVIES_SECTION = os.getenv("MOVIES_SECTION", "Movies")
+DEFAULT_SHOWS_SECTION = os.getenv("SHOWS_SECTION", "TV Shows")
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -85,7 +87,7 @@ def fetch_watchlist(account: MyPlexAccount) -> dict:
             logging.debug("Skipping item without guid: %s", item)
             continue
         item_type = getattr(item, "type", None) or (
-            "movie" if item.TYPE == "movie" else "show"
+            "movie" if getattr(item, "TYPE", "movie") == "movie" else "show"
         )
         current_items[guid] = {
             "guid": guid,
@@ -128,21 +130,39 @@ def resolve_local_item(plex: PlexServer, guid: str, item_type: str):
     return item
 
 
-def get_or_create_playlist(plex: PlexServer, name: str):
+def get_or_create_collection(plex: PlexServer, section_name: str, name: str):
+    """Get or create a regular collection in the given library section.
+
+    Collections are per-library; we look in the specified section.
+    """
     try:
-        playlist = plex.playlist(name)
-        logging.info("Using existing playlist: %s", name)
-        return playlist
-    except Exception:
-        logging.info("Creating new playlist: %s", name)
-        playlist = plex.createPlaylist(name, items=[])
-        return playlist
+        section = plex.library.section(section_name)
+    except Exception as e:
+        raise RuntimeError(f"Library section '{section_name}' not found: {e}")
+
+    try:
+        collections = section.collections()
+    except Exception as e:
+        logging.error("Failed to list collections in section %s: %s", section_name, e)
+        collections = []
+
+    for coll in collections:
+        if getattr(coll, "title", "") == name:
+            logging.info("Using existing collection '%s' in section '%s'", name, section_name)
+            return coll
+
+    logging.info("Creating new collection '%s' in section '%s'", name, section_name)
+    try:
+        collection = plex.createCollection(name, section, items=[])
+    except Exception as e:
+        raise RuntimeError(f"Failed to create collection '{name}' in section '{section_name}': {e}")
+    return collection
 
 
-def update_playlists(
+def update_collections(
     plex: PlexServer,
-    movie_playlist,
-    show_playlist,
+    movie_collection,
+    show_collection,
     cached: dict,
     current_items: dict,
     dry_run: bool,
@@ -180,23 +200,23 @@ def update_playlists(
                 )
                 item = None
             if item is not None:
-                playlist = (
-                    movie_playlist if entry.get("type") == "movie" else show_playlist
+                collection = (
+                    movie_collection if entry.get("type") == "movie" else show_collection
                 )
                 logging.info(
-                    "Removing item %s (guid=%s) from playlist %s",
+                    "Removing item %s (guid=%s) from collection %s",
                     getattr(item, "title", ""),
                     guid,
-                    playlist.title,
+                    collection.title,
                 )
                 if not dry_run:
                     try:
-                        playlist.removeItems([item])
+                        collection.removeItems([item])
                     except Exception as e:
                         logging.error(
-                            "Failed to remove item %s from playlist %s: %s",
+                            "Failed to remove item %s from collection %s: %s",
                             getattr(item, "title", ""),
-                            playlist.title,
+                            collection.title,
                             e,
                         )
         # Remove from cache
@@ -209,21 +229,21 @@ def update_playlists(
         item = resolve_local_item(plex, guid, item_type)
         if item is not None:
             rating_key = getattr(item, "ratingKey", None)
-            playlist = movie_playlist if item_type == "movie" else show_playlist
+            collection = movie_collection if item_type == "movie" else show_collection
             logging.info(
-                "Adding item %s (guid=%s) to playlist %s",
+                "Adding item %s (guid=%s) to collection %s",
                 getattr(item, "title", ""),
                 guid,
-                playlist.title,
+                collection.title,
             )
             if not dry_run:
                 try:
-                    playlist.addItems([item])
+                    collection.addItems([item])
                 except Exception as e:
                     logging.error(
-                        "Failed to add item %s to playlist %s: %s",
+                        "Failed to add item %s to collection %s: %s",
                         getattr(item, "title", ""),
-                        playlist.title,
+                        collection.title,
                         e,
                     )
             cached_items[guid] = {
@@ -261,21 +281,21 @@ def update_playlists(
         if item is None:
             continue
         rating_key = getattr(item, "ratingKey", None)
-        playlist = movie_playlist if item_type == "movie" else show_playlist
+        collection = movie_collection if item_type == "movie" else show_collection
         logging.info(
             "Previously unresolved item %s (guid=%s) now resolvable, adding to %s",
             getattr(item, "title", ""),
             guid,
-            playlist.title,
+            collection.title,
         )
         if not dry_run:
             try:
-                playlist.addItems([item])
+                collection.addItems([item])
             except Exception as e:
                 logging.error(
-                    "Failed to add previously unresolved item %s to playlist %s: %s",
+                    "Failed to add previously unresolved item %s to collection %s: %s",
                     getattr(item, "title", ""),
-                    playlist.title,
+                    collection.title,
                     e,
                 )
         entry["ratingKey"] = rating_key
@@ -293,7 +313,7 @@ def update_playlists(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sync Plex Discover watchlist to local playlists",
+        description="Sync Plex Discover watchlist to local collections",
     )
     parser.add_argument(
         "--plex-base-url",
@@ -311,19 +331,29 @@ def parse_args() -> argparse.Namespace:
         help=f"Path to cache file (default: {DEFAULT_CACHE_PATH})",
     )
     parser.add_argument(
-        "--movie-playlist",
-        default=DEFAULT_MOVIE_PLAYLIST_NAME,
-        help=f"Movies playlist name (default: {DEFAULT_MOVIE_PLAYLIST_NAME})",
+        "--movie-collection",
+        default=DEFAULT_MOVIE_COLLECTION_NAME,
+        help=f"Movies collection name (default: {DEFAULT_MOVIE_COLLECTION_NAME})",
     )
     parser.add_argument(
-        "--show-playlist",
-        default=DEFAULT_SHOW_PLAYLIST_NAME,
-        help=f"Shows playlist name (default: {DEFAULT_SHOW_PLAYLIST_NAME})",
+        "--show-collection",
+        default=DEFAULT_SHOW_COLLECTION_NAME,
+        help=f"Shows collection name (default: {DEFAULT_SHOW_COLLECTION_NAME})",
+    )
+    parser.add_argument(
+        "--movies-section",
+        default=DEFAULT_MOVIES_SECTION,
+        help=f"Name of Movies library section (default: {DEFAULT_MOVIES_SECTION})",
+    )
+    parser.add_argument(
+        "--shows-section",
+        default=DEFAULT_SHOWS_SECTION,
+        help=f"Name of TV Shows library section (default: {DEFAULT_SHOWS_SECTION})",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Compute diffs and log actions but do not modify playlists",
+        help="Compute diffs and log actions but do not modify collections",
     )
     parser.add_argument(
         "--verbose",
@@ -344,13 +374,17 @@ def main() -> None:
 
     current_items = fetch_watchlist(account)
 
-    movie_playlist = get_or_create_playlist(plex, args.movie_playlist)
-    show_playlist = get_or_create_playlist(plex, args.show_playlist)
+    movie_collection = get_or_create_collection(
+        plex, args.movies_section, args.movie_collection
+    )
+    show_collection = get_or_create_collection(
+        plex, args.shows_section, args.show_collection
+    )
 
-    updated_cache = update_playlists(
+    updated_cache = update_collections(
         plex,
-        movie_playlist,
-        show_playlist,
+        movie_collection,
+        show_collection,
         cache,
         current_items,
         dry_run=args.dry_run,
