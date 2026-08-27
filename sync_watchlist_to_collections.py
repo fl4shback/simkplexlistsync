@@ -152,10 +152,25 @@ def get_or_create_collection(plex: PlexServer, section_name: str, name: str):
             return coll
 
     logging.info("Creating new collection '%s' in section '%s'", name, section_name)
+
+    # PlexAPI requires at least one item when creating a collection.
+    # Grab any item from the section as a temporary placeholder.
     try:
-        collection = plex.createCollection(name, section, items=[])
+        placeholder = section.all()[0]
+    except Exception as e:
+        raise RuntimeError(f"Cannot create collection '{name}': no items in section '{section_name}' to use as placeholder: {e}")
+
+    try:
+        collection = plex.createCollection(name, section, items=[placeholder])
     except Exception as e:
         raise RuntimeError(f"Failed to create collection '{name}' in section '{section_name}': {e}")
+
+    # Remove the placeholder so the collection starts empty.
+    try:
+        collection.removeItems([placeholder])
+    except Exception as e:
+        logging.warning("Failed to remove placeholder from collection '%s': %s", name, e)
+
     return collection
 
 
