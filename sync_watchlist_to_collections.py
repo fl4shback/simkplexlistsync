@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Sync Plex Discover watchlist to local collections, with optional SIMKL rank sorting.
+"""Sync Plex Discover watchlist to local Plex collections.
 
-When sorting by SIMKL rank, the desired Plex ratingKey order is persisted in the
-cache. Plex reorder writes are skipped when that desired order has not changed.
+Optional SIMKL-rank sorting uses one metadata TTL (30 days by default) and a
+persisted Plex collection-order cache. Plex reorder writes are skipped whenever
+the desired ratingKey sequence is unchanged.
+
+SIMKL uses separate databases. Resolution is exclusive and sequential per item:
+- Plex movie: SIMKL movies (TMDB, then IMDb), then SIMKL anime (IMDb).
+- Plex show:  SIMKL TV (TVDB, then IMDb), then SIMKL anime (IMDb).
+
+The anime endpoint is a fallback only: a successful movie/TV resolution stops
+further lookup for that item. Separate items may resolve in parallel.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -11,15 +21,21 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Plex configuration
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
 DEFAULT_CACHE_PATH = os.getenv("CACHE_PATH", "./plex-watchlist-cache.json")
 DEFAULT_MOVIE_COLLECTION_NAME = os.getenv("MOVIE_COLLECTION_NAME", "Films à voir")
 DEFAULT_SHOW_COLLECTION_NAME = os.getenv("SHOW_COLLECTION_NAME", "Séries à voir")
@@ -28,27 +44,115 @@ DEFAULT_PLEX_TOKEN = os.getenv("PLEX_TOKEN", "")
 DEFAULT_MOVIES_SECTION = os.getenv("MOVIES_SECTION", "Films")
 DEFAULT_SHOWS_SECTION = os.getenv("SHOWS_SECTION", "Séries TV")
 
-# Sorting and SIMKL configuration
 DEFAULT_COLLECTION_SORT = os.getenv("COLLECTION_SORT", "alpha").strip().lower()
 DEFAULT_SIMKL_CLIENT_ID = os.getenv("SIMKL_CLIENT_ID", "")
-DEFAULT_SIMKL_APP_NAME = os.getenv("SIMKL_APP_NAME", "plex-watchlist-sync")
-DEFAULT_SIMKL_APP_VERSION = os.getenv("SIMKL_APP_VERSION", "1.0")
+DEFAULT_SIMKL_APP_NAME = os.getenv("SIMKL_APP_NAME", "Plex Discover Watchlist Sync")
+DEFAULT_SIMKL_APP_VERSION = os.getenv("SIMKL_APP_VERSION", "v0.4.0")
 DEFAULT_SIMKL_CACHE_TTL = int(os.getenv("SIMKL_CACHE_TTL", "2592000"))
-DEFAULT_SIMKL_ID_CACHE_TTL = int(os.getenv("SIMKL_ID_CACHE_TTL", "31536000"))
-DEFAULT_SIMKL_MAX_WORKERS = int(os.getenv("SIMKL_MAX_WORKERS", "8"))
+DEFAULT_SIMKL_MAX_WORKERS = int(os.getenv("SIMKL_MAX_WORKERS", "6"))
 
-CACHE_VERSION = 3
+CACHE_VERSION = 6
 SIMKL_BASE_URL = "https://api.simkl.com"
-SIMKL_ID_RE = re.compile(r"/(?:movies|tv|anime)/(\d+)(?:/|$)")
+SIMKL_URL_RE = re.compile(r"/(movies|tv|anime)/(\d+)(?:/|$)")
+SIMKL_ENDPOINTS = {"movies", "tv", "anime"}
 
 
-def empty_cache() -> dict:
+@dataclass(frozen=True)
+class SyncStats:
+    watchlist_items: int = 0
+    additions: int = 0
+    removals: int = 0
+    unresolved: int = 0
+    simkl_resolved: int = 0
+    simkl_refreshed: int = 0
+    collections_reordered: int = 0
+    collections_skipped: int = 0
+
+
+# -----------------------------------------------------------------------------
+# Cache
+# -----------------------------------------------------------------------------
+
+
+def empty_cache() -> dict[str, Any]:
     return {
         "version": CACHE_VERSION,
         "last_run": None,
         "items": {},
         "collections": {},
     }
+
+
+def load_cache(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return empty_cache()
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            cache = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("Unable to read cache %s: %s", path, exc)
+        return empty_cache()
+
+    if not isinstance(cache, dict):
+        logging.warning("Invalid cache root; rebuilding cache")
+        return empty_cache()
+
+    cache.setdefault("last_run", None)
+    cache.setdefault("items", {})
+    cache.setdefault("collections", {})
+
+    if not isinstance(cache["items"], dict):
+        logging.warning("Invalid item cache; rebuilding it")
+        cache["items"] = {}
+
+    if not isinstance(cache["collections"], dict):
+        logging.warning("Invalid collection cache; rebuilding it")
+        cache["collections"] = {}
+
+    # Cache v6 and later uses a flat SIMKL record with one fetched_at value. Clear old SIMKL
+    # metadata and collection-order state once so the new layout is rebuilt.
+    if cache.get("version") != CACHE_VERSION:
+        for entry in cache["items"].values():
+            if isinstance(entry, dict):
+                entry.pop("simkl", None)
+        cache["collections"] = {}
+        logging.info("Cache schema changed; SIMKL metadata and collection order will rebuild")
+
+    cache["version"] = CACHE_VERSION
+    return cache
+
+
+def save_cache(path: Path, cache: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cache["last_run"] = datetime.now(timezone.utc).isoformat()
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(cache, file, ensure_ascii=False, indent=2, sort_keys=True)
+
+    temp_path.replace(path)
+
+
+def utc_now() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def is_fresh(record: dict[str, Any] | None, ttl: int, now: int) -> bool:
+    if not isinstance(record, dict):
+        return False
+
+    try:
+        fetched_at = int(record.get("fetched_at"))
+    except (TypeError, ValueError):
+        return False
+
+    return now - fetched_at < ttl
+
+
+# -----------------------------------------------------------------------------
+# Logging and HTTP
+# -----------------------------------------------------------------------------
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -58,66 +162,62 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
-def load_cache(path: Path) -> dict:
-    if not path.exists():
-        return empty_cache()
+def make_simkl_session(args: argparse.Namespace) -> requests.Session:
+    """Build a per-worker SIMKL session with retries for transient failures."""
+    session = requests.Session()
+    session.params.update(
+        {
+            "client_id": args.simkl_client_id,
+            "app-name": args.simkl_app_name,
+            "app-version": args.simkl_app_version,
+        }
+    )
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "User-Agent": f"{args.simkl_app_name}/{args.simkl_app_version}",
+        }
+    )
 
-    try:
-        with path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        data.setdefault("version", CACHE_VERSION)
-        data.setdefault("last_run", None)
-        data.setdefault("items", {})
-        data.setdefault("collections", {})
-
-        if not isinstance(data["items"], dict):
-            logging.warning("Invalid items cache; rebuilding it")
-            data["items"] = {}
-
-        if not isinstance(data["collections"], dict):
-            logging.warning("Invalid collections cache; rebuilding it")
-            data["collections"] = {}
-
-        data["version"] = CACHE_VERSION
-        return data
-
-    except (OSError, json.JSONDecodeError) as exc:
-        logging.warning("Unable to read cache %s: %s", path, exc)
-        return empty_cache()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+    session.mount("https://", adapter)
+    return session
 
 
-def save_cache(path: Path, cache: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    cache["last_run"] = datetime.now(timezone.utc).isoformat()
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-
-    with temp_path.open("w", encoding="utf-8") as file:
-        json.dump(cache, file, ensure_ascii=False, indent=2)
-
-    temp_path.replace(path)
+# -----------------------------------------------------------------------------
+# Plex watchlist and collections
+# -----------------------------------------------------------------------------
 
 
 def connect_plex(base_url: str, token: str) -> tuple[MyPlexAccount, PlexServer]:
     if not token:
         raise RuntimeError("PLEX_TOKEN is required")
 
-    account = MyPlexAccount(token=token)
-    plex = PlexServer(base_url, token)
-    return account, plex
+    return MyPlexAccount(token=token), PlexServer(base_url, token)
 
 
-def fetch_watchlist(account: MyPlexAccount) -> dict[str, dict]:
+def fetch_watchlist(account: MyPlexAccount) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+
     movies = account.watchlist(libtype="movie")
     shows = account.watchlist(libtype="show")
-    result: dict[str, dict] = {}
 
     for item in movies + shows:
         guid = getattr(item, "guid", None)
-        if not guid:
+        item_type = getattr(item, "type", None)
+
+        if not guid or item_type not in {"movie", "show"}:
             continue
 
-        item_type = getattr(item, "type", None) or "movie"
         result[guid] = {
             "guid": guid,
             "type": item_type,
@@ -129,16 +229,6 @@ def fetch_watchlist(account: MyPlexAccount) -> dict[str, dict]:
     return result
 
 
-def resolve_local_item(plex: PlexServer, guid: str, item_type: str):
-    try:
-        results = plex.library.search(guid=guid, libtype=item_type)
-    except Exception as exc:
-        logging.warning("Search failed for %s: %s", guid, exc)
-        return None
-
-    return results[0] if results else None
-
-
 def get_or_create_collection(plex: PlexServer, section_name: str, name: str):
     section = plex.library.section(section_name)
 
@@ -146,125 +236,145 @@ def get_or_create_collection(plex: PlexServer, section_name: str, name: str):
         if collection.title == name:
             return collection
 
-    library_items = section.all()
-    if not library_items:
+    placeholder_items = section.all(maxresults=1)
+    if not placeholder_items:
         raise RuntimeError(
             f"Cannot create collection {name!r}: library section {section_name!r} is empty"
         )
 
-    placeholder = library_items[0]
-    collection = plex.createCollection(name, section, items=[placeholder])
-    collection.removeItems([placeholder])
+    collection = plex.createCollection(name, section, items=placeholder_items)
+    collection.removeItems(placeholder_items)
+    logging.info("Created Plex collection %s in %s", name, section_name)
     return collection
+
+
+def item_rating_key(item: Any) -> int | None:
+    try:
+        value = getattr(item, "ratingKey", None)
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_local_items(
+    plex: PlexServer,
+    current: dict[str, dict[str, Any]],
+    cache_items: dict[str, dict[str, Any]],
+) -> dict[str, Any | None]:
+    """Search Plex only for new/unresolved GUIDs.
+
+    A cached ratingKey is retained without a per-run metadata fetch, which is
+    the main reduction in local PMS calls on no-change runs.
+    """
+    resolved: dict[str, Any | None] = {}
+
+    for guid, meta in current.items():
+        cached = cache_items.get(guid, {})
+        if cached.get("ratingKey"):
+            resolved[guid] = None
+            continue
+
+        try:
+            matches = plex.library.search(guid=guid, libtype=meta["type"])
+        except Exception as exc:
+            logging.warning("Plex GUID search failed for %s: %s", guid, exc)
+            resolved[guid] = None
+            continue
+
+        resolved[guid] = matches[0] if matches else None
+
+    return resolved
 
 
 def update_collections(
     plex: PlexServer,
-    movie_collection,
-    show_collection,
-    cache: dict,
-    current: dict[str, dict],
+    movie_collection: Any,
+    show_collection: Any,
+    cache: dict[str, Any],
+    current: dict[str, dict[str, Any]],
     dry_run: bool,
-) -> tuple[dict, dict[str, bool]]:
-    cached_items = cache["items"]
+) -> tuple[dict[str, Any], dict[str, bool], SyncStats]:
+    cache_items = cache["items"]
     current_guids = set(current)
-    collection_changed = {"movie": False, "show": False}
+    changed = {"movie": False, "show": False}
 
-    # Removals
-    to_remove = {"movie": [], "show": []}
-
-    for guid in set(cached_items) - current_guids:
-        entry = cached_items.pop(guid)
+    removals: dict[str, list[Any]] = {"movie": [], "show": []}
+    for guid in set(cache_items) - current_guids:
+        entry = cache_items.pop(guid)
         item_type = entry.get("type")
+        rating_key = entry.get("ratingKey")
 
-        if item_type not in to_remove or not entry.get("ratingKey"):
+        if item_type not in removals or not rating_key:
             continue
 
         try:
-            item = plex.fetchItem(int(entry["ratingKey"]))
-            to_remove[item_type].append(item)
+            removals[item_type].append(plex.fetchItem(int(rating_key)))
         except Exception as exc:
-            logging.warning("Unable to remove %s: %s", guid, exc)
+            logging.warning("Unable to fetch removed item %s: %s", guid, exc)
 
     if not dry_run:
-        if to_remove["movie"]:
-            movie_collection.removeItems(to_remove["movie"])
-            collection_changed["movie"] = True
+        if removals["movie"]:
+            movie_collection.removeItems(removals["movie"])
+            changed["movie"] = True
+        if removals["show"]:
+            show_collection.removeItems(removals["show"])
+            changed["show"] = True
 
-        if to_remove["show"]:
-            show_collection.removeItems(to_remove["show"])
-            collection_changed["show"] = True
-
-    # Additions / updates
-    to_add = {"movie": [], "show": []}
+    resolved = resolve_local_items(plex, current, cache_items)
+    additions: dict[str, list[Any]] = {"movie": [], "show": []}
+    unresolved_count = 0
 
     for guid, meta in current.items():
-        entry = cached_items.get(guid, {})
-        item = None
+        old_entry = cache_items.get(guid, {})
+        local_item = resolved[guid]
 
-        if entry.get("ratingKey"):
-            try:
-                item = plex.fetchItem(int(entry["ratingKey"]))
-            except Exception:
-                item = None
-
-        if item is None:
-            item = resolve_local_item(plex, guid, meta["type"])
-
-        if item is not None:
-            is_new_collection_item = not entry.get("ratingKey")
-
-            if is_new_collection_item and not dry_run:
-                to_add[meta["type"]].append(item)
-
-            cached_items[guid] = {
-                **entry,
+        if old_entry.get("ratingKey"):
+            cache_items[guid] = {
+                **old_entry,
                 **meta,
-                "ratingKey": getattr(item, "ratingKey", None),
                 "unresolved": False,
             }
-        else:
-            cached_items[guid] = {
-                **entry,
+            continue
+
+        if local_item is None:
+            cache_items[guid] = {
+                **old_entry,
                 **meta,
                 "ratingKey": None,
                 "unresolved": True,
             }
+            unresolved_count += 1
+            continue
+
+        rating_key = item_rating_key(local_item)
+        cache_items[guid] = {
+            **old_entry,
+            **meta,
+            "ratingKey": rating_key,
+            "unresolved": False,
+        }
+
+        if rating_key is not None:
+            additions[meta["type"]].append(local_item)
 
     if not dry_run:
-        if to_add["movie"]:
-            movie_collection.addItems(to_add["movie"])
-            collection_changed["movie"] = True
+        if additions["movie"]:
+            movie_collection.addItems(additions["movie"])
+            changed["movie"] = True
+        if additions["show"]:
+            show_collection.addItems(additions["show"])
+            changed["show"] = True
 
-        if to_add["show"]:
-            show_collection.addItems(to_add["show"])
-            collection_changed["show"] = True
-
-    return cache, collection_changed
-
-
-def utc_now() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
-
-
-def is_cache_fresh(entry: dict[str, Any] | None, ttl: int, now: int) -> bool:
-    if not entry:
-        return False
-
-    fetched_at = entry.get("fetched_at")
-    if fetched_at is None:
-        return False
-
-    try:
-        fetched_at = int(fetched_at)
-    except (TypeError, ValueError):
-        return False
-
-    return now - fetched_at < ttl
+    stats = SyncStats(
+        additions=len(additions["movie"]) + len(additions["show"]),
+        removals=len(removals["movie"]) + len(removals["show"]),
+        unresolved=unresolved_count,
+    )
+    return cache, changed, stats
 
 
-def get_guid_ids(media_item) -> dict[str, str]:
-    """Return Plex provider IDs: TMDB, TVDB and IMDb where present."""
+def get_guid_ids(media_item: Any) -> dict[str, str]:
+    """Extract local Plex provider IDs usable by SIMKL redirect lookups."""
     ids: dict[str, str] = {}
 
     for guid in getattr(media_item, "guids", []) or []:
@@ -274,450 +384,338 @@ def get_guid_ids(media_item) -> dict[str, str]:
 
         provider, value = raw.split("://", 1)
         provider = provider.lower()
-
         if provider in {"tmdb", "tvdb", "imdb"} and value:
             ids[provider] = value
 
     return ids
 
 
-def resolve_simkl_id(
-    provider_ids: dict[str, str],
-    media_type: str,
-    args: argparse.Namespace,
-) -> tuple[int | None, str | None]:
-    """Resolve movie: TMDB then IMDb; show: TVDB then IMDb.
+# -----------------------------------------------------------------------------
+# SIMKL
+# -----------------------------------------------------------------------------
 
-    SIMKL /redirect responds with a 301. The Location header contains the
-    canonical SIMKL URL, including its numeric ID. Redirects are not followed.
+
+def simkl_candidates(
+    plex_type: str,
+    provider_ids: dict[str, str],
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Return exclusive SIMKL resolver candidates in priority order.
+
+    The anime candidates are fallback-only. They are reached only when no movie
+    or TV candidate returned a valid SIMKL redirect for the current item.
     """
-    if media_type == "movie":
+    if plex_type == "movie":
         candidates = (
-            ("tmdb", provider_ids.get("tmdb")),
-            ("imdb", provider_ids.get("imdb")),
+            ("movie", "movies", "tmdb", provider_ids.get("tmdb")),
+            ("movie", "movies", "imdb", provider_ids.get("imdb")),
+            ("anime", "anime", "imdb", provider_ids.get("imdb")),
         )
-        simkl_type = "movie"
     else:
         candidates = (
-            ("tvdb", provider_ids.get("tvdb")),
-            ("imdb", provider_ids.get("imdb")),
+            ("tv", "tv", "tvdb", provider_ids.get("tvdb")),
+            ("tv", "tv", "imdb", provider_ids.get("imdb")),
+            ("anime", "anime", "imdb", provider_ids.get("imdb")),
         )
-        simkl_type = "tv"
 
-    for provider, external_id in candidates:
-        if not external_id:
-            continue
+    return tuple(candidate for candidate in candidates if candidate[3])
 
-        params = {
-            "client_id": args.simkl_client_id,
-            "app-name": args.simkl_app_name,
-            "app-version": args.simkl_app_version,
-            "to": "simkl",
-            "type": simkl_type,
-            provider: external_id,
-        }
 
+def resolve_simkl(
+    session: requests.Session,
+    plex_type: str,
+    provider_ids: dict[str, str],
+) -> dict[str, Any] | None:
+    """Resolve exactly one SIMKL record using the ordered candidate list."""
+    for requested_type, expected_endpoint, provider, external_id in simkl_candidates(
+        plex_type,
+        provider_ids,
+    ):
         try:
-            response = requests.get(
+            response = session.get(
                 f"{SIMKL_BASE_URL}/redirect",
-                params=params,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": (
-                        f"{args.simkl_app_name}/{args.simkl_app_version}"
-                    ),
+                params={
+                    "to": "simkl",
+                    "type": requested_type,
+                    provider: external_id,
                 },
                 timeout=20,
                 allow_redirects=False,
             )
         except requests.RequestException as exc:
-            logging.warning(
-                "SIMKL redirect lookup failed for %s=%s: %s",
-                provider,
-                external_id,
-                exc,
-            )
+            logging.warning("SIMKL redirect failed for %s=%s (%s): %s", provider, external_id, requested_type, exc)
             continue
 
         if response.status_code != 301:
-            logging.info(
-                "SIMKL could not resolve %s=%s (HTTP %s)",
-                provider,
-                external_id,
-                response.status_code,
-            )
+            logging.debug("SIMKL did not resolve %s=%s as %s (HTTP %s)", provider, external_id, requested_type, response.status_code)
             continue
 
         location = response.headers.get("Location", "")
-        match = SIMKL_ID_RE.search(location)
+        match = SIMKL_URL_RE.search(location)
+        if not match:
+            logging.warning("SIMKL redirect had an unparsable Location: %s", location)
+            continue
 
-        if match:
-            return int(match.group(1)), provider
+        endpoint, simkl_id = match.group(1), int(match.group(2))
+        if endpoint != expected_endpoint:
+            logging.warning("SIMKL returned %s while resolving expected %s; ignoring result", endpoint, expected_endpoint)
+            continue
 
-        logging.warning("SIMKL redirect had no parsable media ID: %s", location)
+        logging.debug("SIMKL resolved %s=%s as %s/%s", provider, external_id, endpoint, simkl_id)
+        return {
+            "id": simkl_id,
+            "endpoint": endpoint,
+            "source": provider,
+        }
 
-    return None, None
+    return None
 
 
-def fetch_simkl_rank(
+def fetch_simkl_metadata(
+    session: requests.Session,
     simkl_id: int,
-    media_type: str,
-    args: argparse.Namespace,
-) -> int | None:
-    """Fetch the top-level rank field from the SIMKL detail endpoint."""
-    endpoint = "movies" if media_type == "movie" else "tv"
-    url = f"{SIMKL_BASE_URL}/{endpoint}/{simkl_id}"
+    endpoint: str,
+) -> dict[str, Any] | None:
+    if endpoint not in SIMKL_ENDPOINTS:
+        raise ValueError(f"Unsupported SIMKL endpoint: {endpoint}")
 
+    url = f"{SIMKL_BASE_URL}/{endpoint}/{simkl_id}"
     try:
-        response = requests.get(
-            url,
-            params={
-                "client_id": args.simkl_client_id,
-                "app-name": args.simkl_app_name,
-                "app-version": args.simkl_app_version,
-            },
-            headers={
-                "Accept": "application/json",
-                "User-Agent": f"{args.simkl_app_name}/{args.simkl_app_version}",
-            },
-            timeout=20,
-        )
+        response = session.get(url, timeout=20)
         response.raise_for_status()
-    except requests.RequestException as exc:
-        logging.warning("SIMKL rank HTTP error for %s: %s", url, exc)
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logging.warning("SIMKL metadata fetch failed for %s: %s", url, exc)
         return None
 
-    payload = response.json()
-    rank = payload.get("rank")
+    if not isinstance(payload, dict):
+        logging.warning("Unexpected SIMKL response for %s", url)
+        return None
 
-    logging.debug(
-        "SIMKL %s/%s -> rank=%r (full keys: %s)",
-        endpoint,
-        simkl_id,
-        rank,
-        list(payload.keys()),
-    )
+    try:
+        rank = int(payload["rank"]) if payload.get("rank") is not None else None
+    except (TypeError, ValueError):
+        rank = None
 
-    return int(rank) if rank is not None else None
+    metadata: dict[str, Any] = {"rank": rank}
+    if endpoint == "anime":
+        metadata.update(
+            {
+                "anime_type": payload.get("anime_type"),
+                "total_episodes": payload.get("total_episodes"),
+                "runtime": payload.get("runtime"),
+            }
+        )
+
+    return metadata
 
 
 def populate_simkl_metadata(
     plex: PlexServer,
-    cache: dict,
+    cache: dict[str, Any],
     args: argparse.Namespace,
-) -> None:
-    """Resolve SIMKL IDs and fetch ranks only for entries with stale metadata."""
+) -> SyncStats:
+    """Refresh stale SIMKL records with one 30-day TTL for all SIMKL data."""
     if not args.simkl_client_id:
-        return
+        return SyncStats()
 
     now = utc_now()
-    items = cache.get("items", {})
+    stale = [
+        (guid, entry)
+        for guid, entry in cache["items"].items()
+        if not entry.get("unresolved")
+        and entry.get("ratingKey")
+        and not is_fresh(entry.get("simkl"), args.simkl_cache_ttl, now)
+    ]
 
-    # Pass 1: SIMKL ID resolution.
-    to_resolve = []
-
-    for guid, entry in items.items():
-        if entry.get("unresolved") or not entry.get("ratingKey"):
-            continue
-
-        simkl = entry.setdefault("simkl", {})
-        id_entry = simkl.get("id", {})
-
-        if not is_cache_fresh(id_entry, args.simkl_id_cache_ttl, now):
-            to_resolve.append((guid, entry))
-
-    if to_resolve:
-        logging.info("SIMKL metadata: %d items need ID resolution", len(to_resolve))
-
-        def resolve_work(guid_entry):
-            guid, entry = guid_entry
-
-            try:
-                local_item = plex.fetchItem(int(entry["ratingKey"]))
-            except Exception as exc:
-                logging.warning(
-                    "Could not fetch %s for SIMKL ID resolution: %s",
-                    guid,
-                    exc,
-                )
-                return guid, None, None
-
-            simkl_id, source = resolve_simkl_id(
-                get_guid_ids(local_item),
-                entry["type"],
-                args,
-            )
-            return guid, simkl_id, source
-
-        with ThreadPoolExecutor(max_workers=args.simkl_max_workers) as executor:
-            futures = {
-                executor.submit(resolve_work, task): task
-                for task in to_resolve
-            }
-
-            for future in as_completed(futures):
-                guid, _ = futures[future]
-
-                try:
-                    guid, simkl_id, source = future.result()
-                except Exception as exc:
-                    logging.warning("SIMKL ID resolution failed: %s", exc)
-                    continue
-
-                if simkl_id is None:
-                    continue
-
-                entry = items.get(guid)
-                if not entry:
-                    continue
-
-                entry.setdefault("simkl", {})["id"] = {
-                    "value": simkl_id,
-                    "source": source,
-                    "fetched_at": now,
-                }
-
-    # Pass 2: SIMKL rank refresh.
-    to_fetch_rank = []
-
-    for guid, entry in items.items():
-        if entry.get("unresolved") or not entry.get("ratingKey"):
-            continue
-
-        simkl = entry.get("simkl", {})
-        id_entry = simkl.get("id", {})
-        simkl_id = id_entry.get("value") if id_entry else None
-
-        if not simkl_id:
-            continue
-
-        rank_entry = simkl.get("rank")
-
-        if not is_cache_fresh(rank_entry, args.simkl_cache_ttl, now):
-            to_fetch_rank.append((guid, int(simkl_id), entry["type"]))
-
-    if to_fetch_rank:
-        logging.info("SIMKL metadata: %d items need rank refresh", len(to_fetch_rank))
-
-        def rank_work(task):
-            guid, simkl_id, media_type = task
-            rank = fetch_simkl_rank(simkl_id, media_type, args)
-            return guid, simkl_id, rank
-
-        with ThreadPoolExecutor(max_workers=args.simkl_max_workers) as executor:
-            futures = {
-                executor.submit(rank_work, task): task
-                for task in to_fetch_rank
-            }
-
-            for future in as_completed(futures):
-                try:
-                    guid, simkl_id, rank = future.result()
-                except Exception as exc:
-                    logging.warning("SIMKL rank fetch failed: %s", exc)
-                    continue
-
-                entry = items.get(guid)
-                if not entry:
-                    logging.warning(
-                        "Cache entry missing for %s when writing SIMKL rank",
-                        guid,
-                    )
-                    continue
-
-                entry.setdefault("simkl", {})["rank"] = {
-                    "value": rank,
-                    "fetched_at": now,
-                }
-
-                logging.debug(
-                    "Cached rank for %s: simkl_id=%s, rank=%s",
-                    guid,
-                    simkl_id,
-                    rank,
-                )
-
-    if not to_resolve and not to_fetch_rank:
+    if not stale:
         logging.debug("SIMKL metadata fully fresh; no API calls needed")
+        return SyncStats()
 
+    logging.info("SIMKL metadata: %d items need refresh", len(stale))
 
-def simkl_sort_key(item, cache: dict) -> tuple[bool, int, str]:
-    guid = getattr(item, "guid", None)
-    value = (
-        cache.get("items", {})
-        .get(guid, {})
-        .get("simkl", {})
-        .get("rank", {})
-        .get("value")
-    )
+    def refresh_one(task: tuple[str, dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
+        guid, entry = task
 
-    return (
-        value is None,
-        value if value is not None else 2**31 - 1,
-        getattr(item, "title", "").casefold(),
-    )
+        try:
+            local_item = plex.fetchItem(int(entry["ratingKey"]))
+        except Exception as exc:
+            logging.warning("Unable to fetch %s for SIMKL resolution: %s", guid, exc)
+            return guid, None
 
-
-def collection_cache_key(collection) -> str:
-    """Return a cache key unique to a Plex library section and collection title."""
-    section_key = getattr(collection, "librarySectionID", None)
-
-    if section_key is None:
-        section = getattr(collection, "section", None)
-        section_key = getattr(section, "key", "unknown")
-
-    return f"{section_key}:{collection.title}"
-
-
-def item_rating_key(item) -> int | None:
-    """Return an item's Plex ratingKey as an int, if available."""
-    rating_key = getattr(item, "ratingKey", None)
-
-    try:
-        return int(rating_key) if rating_key is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def item_order_signature(items) -> list[int]:
-    """Return the persisted custom-order signature for a sequence of Plex items."""
-    signature = []
-
-    for item in items:
-        rating_key = item_rating_key(item)
-
-        if rating_key is None:
-            logging.warning(
-                "Skipping %r in collection-order cache: missing ratingKey",
-                getattr(item, "title", "<unknown>"),
+        # Session instances are intentionally not shared across worker threads.
+        session = make_simkl_session(args)
+        try:
+            resolved = resolve_simkl(
+                session,
+                entry["type"],
+                get_guid_ids(local_item),
             )
-            continue
+            if resolved is None:
+                return guid, None
 
-        signature.append(rating_key)
+            metadata = fetch_simkl_metadata(
+                session,
+                resolved["id"],
+                resolved["endpoint"],
+            )
+            if metadata is None:
+                return guid, None
 
-    return signature
+            return guid, {
+                **resolved,
+                **metadata,
+                "fetched_at": now,
+            }
+        finally:
+            session.close()
+
+    refreshed = 0
+    resolved_count = 0
+
+    with ThreadPoolExecutor(max_workers=args.simkl_max_workers) as executor:
+        futures = {executor.submit(refresh_one, task): task[0] for task in stale}
+
+        for future in as_completed(futures):
+            fallback_guid = futures[future]
+            try:
+                guid, record = future.result()
+            except Exception as exc:
+                logging.warning("SIMKL worker failed for %s: %s", fallback_guid, exc)
+                continue
+
+            if record is None:
+                continue
+
+            old_record = cache["items"][guid].get("simkl")
+            if not isinstance(old_record, dict) or old_record.get("id") != record["id"]:
+                resolved_count += 1
+
+            cache["items"][guid]["simkl"] = record
+            refreshed += 1
+
+            logging.debug(
+                "Cached SIMKL %s/%s for %s (rank=%s)",
+                record["endpoint"],
+                record["id"],
+                guid,
+                record["rank"],
+            )
+
+    return SyncStats(
+        simkl_resolved=resolved_count,
+        simkl_refreshed=refreshed,
+    )
 
 
-def cached_collection_order(
-    cache: dict,
-    collection,
-    mode: str,
-) -> list[int] | None:
-    entry = cache.get("collections", {}).get(collection_cache_key(collection))
+# -----------------------------------------------------------------------------
+# Collection order cache
+# -----------------------------------------------------------------------------
 
-    if not entry or entry.get("sort_mode") != mode:
+
+def collection_cache_key(collection: Any) -> str:
+    section_id = getattr(collection, "librarySectionID", "unknown")
+    return f"{section_id}:{collection.title}"
+
+
+def order_signature(items: Iterable[Any]) -> list[int]:
+    return [
+        rating_key
+        for item in items
+        if (rating_key := item_rating_key(item)) is not None
+    ]
+
+
+def get_cached_order(cache: dict[str, Any], collection: Any) -> list[int] | None:
+    record = cache["collections"].get(collection_cache_key(collection))
+    if not isinstance(record, dict) or record.get("sort_mode") != "simkl":
         return None
 
-    rating_keys = entry.get("rating_keys")
+    rating_keys = record.get("rating_keys")
     if not isinstance(rating_keys, list):
         return None
 
     try:
-        return [int(rating_key) for rating_key in rating_keys]
+        return [int(value) for value in rating_keys]
     except (TypeError, ValueError):
-        logging.warning(
-            "Invalid cached collection order for %s; rebuilding",
-            collection.title,
-        )
         return None
 
 
-def save_collection_order(
-    cache: dict,
-    collection,
-    mode: str,
-    rating_keys: list[int],
-) -> None:
-    cache.setdefault("collections", {})[collection_cache_key(collection)] = {
-        "sort_mode": mode,
+def store_order(cache: dict[str, Any], collection: Any, rating_keys: list[int]) -> None:
+    cache["collections"][collection_cache_key(collection)] = {
+        "sort_mode": "simkl",
         "rating_keys": rating_keys,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def invalidate_collection_order(cache: dict, collection) -> None:
-    cache.setdefault("collections", {}).pop(collection_cache_key(collection), None)
+def invalidate_order(cache: dict[str, Any], collection: Any) -> None:
+    cache["collections"].pop(collection_cache_key(collection), None)
+
+
+def simkl_sort_key(item: Any, cache: dict[str, Any]) -> tuple[bool, int, str]:
+    guid = getattr(item, "guid", None)
+    simkl = cache["items"].get(guid, {}).get("simkl", {})
+    rank = simkl.get("rank") if isinstance(simkl, dict) else None
+
+    return (
+        rank is None,
+        rank if isinstance(rank, int) else 2**31 - 1,
+        getattr(item, "title", "").casefold(),
+    )
 
 
 def sort_collection(
-    collection,
+    collection: Any,
     mode: str,
-    cache: dict,
+    cache: dict[str, Any],
     dry_run: bool,
-) -> bool:
-    """Set collection ordering, skipping no-op SIMKL reorder writes.
-
-    The cached order is the previously applied desired ratingKey sequence.  It is
-    intentionally authoritative: manual Plex reorders are not detected. Remove
-    the corresponding cache entry or pass --force-reorder to repair manually
-    changed order.
-    """
+) -> tuple[bool, bool]:
+    """Return (was_reordered, was_skipped)."""
     if mode == "alpha":
         logging.info("Setting %s to alphabetical collection ordering", collection.title)
-
-        if dry_run:
-            return False
-
-        collection.sortUpdate("alpha")
-        save_collection_order(cache, collection, "alpha", [])
-        return True
+        if not dry_run:
+            collection.sortUpdate("alpha")
+        return True, False
 
     if mode != "simkl":
-        raise ValueError("COLLECTION_SORT must be either 'alpha' or 'simkl'")
+        raise ValueError("COLLECTION_SORT must be 'alpha' or 'simkl'")
 
     collection_items = collection.items()
-    ordered_items = sorted(
+    desired_items = sorted(
         collection_items,
         key=lambda item: simkl_sort_key(item, cache),
     )
-    desired_order = item_order_signature(ordered_items)
-    previous_order = cached_collection_order(cache, collection, "simkl")
+    desired_order = order_signature(desired_items)
 
-    if previous_order == desired_order:
-        logging.info(
-            "%s SIMKL order unchanged (%d items); skipping Plex reorder",
-            collection.title,
-            len(desired_order),
-        )
-        return False
+    if get_cached_order(cache, collection) == desired_order:
+        logging.info("%s SIMKL order unchanged (%d items); skipping Plex reorder", collection.title, len(desired_order))
+        return False, True
 
-    logging.info(
-        "%s SIMKL order changed; applying custom order for %d items",
-        collection.title,
-        len(desired_order),
-    )
-
+    logging.info("Applying SIMKL custom order to %s (%d items)", collection.title, len(desired_order))
     if dry_run:
-        logging.info(
-            "Would update %s order: old=%s new=%s",
-            collection.title,
-            previous_order,
-            desired_order,
-        )
-        return False
+        return False, False
 
     collection.sortUpdate("custom")
-
     after = None
-    for item in ordered_items:
+    for item in desired_items:
         if item_rating_key(item) is None:
             continue
-
         collection.moveItem(item, after=after)
         after = item
 
-    save_collection_order(cache, collection, "simkl", desired_order)
-    return True
+    store_order(cache, collection, desired_order)
+    return True, False
+
+
+# -----------------------------------------------------------------------------
+# CLI and orchestration
+# -----------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Sync Plex Discover watchlist to local collections, "
-            "with optional SIMKL rank sorting"
-        )
+        description="Sync Plex Discover watchlist to local collections with optional SIMKL sorting"
     )
-
     parser.add_argument("--plex-base-url", default=DEFAULT_PLEX_BASE_URL)
     parser.add_argument("--plex-token", default=DEFAULT_PLEX_TOKEN)
     parser.add_argument("--cache-path", default=DEFAULT_CACHE_PATH)
@@ -725,38 +723,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-collection", default=DEFAULT_SHOW_COLLECTION_NAME)
     parser.add_argument("--movies-section", default=DEFAULT_MOVIES_SECTION)
     parser.add_argument("--shows-section", default=DEFAULT_SHOWS_SECTION)
-    parser.add_argument(
-        "--sort",
-        dest="sort_mode",
-        default=DEFAULT_COLLECTION_SORT,
-        choices=("alpha", "simkl"),
-    )
+    parser.add_argument("--sort", dest="sort_mode", default=DEFAULT_COLLECTION_SORT, choices=("alpha", "simkl"))
     parser.add_argument("--simkl-client-id", default=DEFAULT_SIMKL_CLIENT_ID)
     parser.add_argument("--simkl-app-name", default=DEFAULT_SIMKL_APP_NAME)
     parser.add_argument("--simkl-app-version", default=DEFAULT_SIMKL_APP_VERSION)
-    parser.add_argument(
-        "--simkl-cache-ttl",
-        type=int,
-        default=DEFAULT_SIMKL_CACHE_TTL,
-    )
-    parser.add_argument(
-        "--simkl-id-cache-ttl",
-        type=int,
-        default=DEFAULT_SIMKL_ID_CACHE_TTL,
-    )
-    parser.add_argument(
-        "--simkl-max-workers",
-        type=int,
-        default=DEFAULT_SIMKL_MAX_WORKERS,
-    )
-    parser.add_argument(
-        "--force-reorder",
-        action="store_true",
-        help="Ignore cached SIMKL collection order and apply it again",
-    )
+    parser.add_argument("--simkl-cache-ttl", type=int, default=DEFAULT_SIMKL_CACHE_TTL, help="SIMKL metadata TTL in seconds (default: 2592000 / 30 days)")
+    parser.add_argument("--simkl-max-workers", type=int, default=DEFAULT_SIMKL_MAX_WORKERS)
+    parser.add_argument("--force-reorder", action="store_true", help="Discard saved SIMKL order and apply the desired order again")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
+
+
+def merge_stats(*stats: SyncStats) -> SyncStats:
+    return SyncStats(
+        watchlist_items=sum(stat.watchlist_items for stat in stats),
+        additions=sum(stat.additions for stat in stats),
+        removals=sum(stat.removals for stat in stats),
+        unresolved=sum(stat.unresolved for stat in stats),
+        simkl_resolved=sum(stat.simkl_resolved for stat in stats),
+        simkl_refreshed=sum(stat.simkl_refreshed for stat in stats),
+        collections_reordered=sum(stat.collections_reordered for stat in stats),
+        collections_skipped=sum(stat.collections_skipped for stat in stats),
+    )
 
 
 def main() -> None:
@@ -766,7 +755,7 @@ def main() -> None:
     cache_path = Path(args.cache_path)
     cache = load_cache(cache_path)
     account, plex = connect_plex(args.plex_base_url, args.plex_token)
-    current = fetch_watchlist(account)
+    watchlist = fetch_watchlist(account)
 
     movie_collection = get_or_create_collection(
         plex,
@@ -779,39 +768,62 @@ def main() -> None:
         args.show_collection,
     )
 
-    cache, collection_changed = update_collections(
+    cache, membership_changed, collection_stats = update_collections(
         plex,
         movie_collection,
         show_collection,
         cache,
-        current,
+        watchlist,
         args.dry_run,
     )
 
-    if collection_changed["movie"]:
-        invalidate_collection_order(cache, movie_collection)
-
-    if collection_changed["show"]:
-        invalidate_collection_order(cache, show_collection)
+    if membership_changed["movie"]:
+        invalidate_order(cache, movie_collection)
+    if membership_changed["show"]:
+        invalidate_order(cache, show_collection)
 
     if args.force_reorder:
-        invalidate_collection_order(cache, movie_collection)
-        invalidate_collection_order(cache, show_collection)
+        invalidate_order(cache, movie_collection)
+        invalidate_order(cache, show_collection)
 
+    simkl_stats = SyncStats()
     if args.sort_mode == "simkl" and args.simkl_client_id:
-        populate_simkl_metadata(plex, cache, args)
+        simkl_stats = populate_simkl_metadata(plex, cache, args)
 
-    sort_collection(
+    movie_reordered, movie_skipped = sort_collection(
         movie_collection,
         args.sort_mode,
         cache,
         args.dry_run,
     )
-    sort_collection(
+    show_reordered, show_skipped = sort_collection(
         show_collection,
         args.sort_mode,
         cache,
         args.dry_run,
+    )
+
+    stats = merge_stats(
+        SyncStats(watchlist_items=len(watchlist)),
+        collection_stats,
+        simkl_stats,
+        SyncStats(
+            collections_reordered=int(movie_reordered) + int(show_reordered),
+            collections_skipped=int(movie_skipped) + int(show_skipped),
+        ),
+    )
+
+    logging.info(
+        "Summary: watchlist=%d additions=%d removals=%d unresolved=%d "
+        "simkl_resolved=%d simkl_refreshed=%d collections_reordered=%d collections_skipped=%d",
+        stats.watchlist_items,
+        stats.additions,
+        stats.removals,
+        stats.unresolved,
+        stats.simkl_resolved,
+        stats.simkl_refreshed,
+        stats.collections_reordered,
+        stats.collections_skipped,
     )
 
     if not args.dry_run:
