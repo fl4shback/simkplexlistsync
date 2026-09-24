@@ -47,11 +47,11 @@ DEFAULT_SHOWS_SECTION = os.getenv("SHOWS_SECTION", "Séries TV")
 DEFAULT_COLLECTION_SORT = os.getenv("COLLECTION_SORT", "alpha").strip().lower()
 DEFAULT_SIMKL_CLIENT_ID = os.getenv("SIMKL_CLIENT_ID", "")
 DEFAULT_SIMKL_APP_NAME = os.getenv("SIMKL_APP_NAME", "Plex Discover Watchlist Sync")
-DEFAULT_SIMKL_APP_VERSION = os.getenv("SIMKL_APP_VERSION", "v0.4.1")
+DEFAULT_SIMKL_APP_VERSION = os.getenv("SIMKL_APP_VERSION", "v0.5.0")
 DEFAULT_SIMKL_CACHE_TTL = int(os.getenv("SIMKL_CACHE_TTL", "2592000"))
 DEFAULT_SIMKL_MAX_WORKERS = int(os.getenv("SIMKL_MAX_WORKERS", "6"))
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 SIMKL_BASE_URL = "https://api.simkl.com"
 SIMKL_URL_RE = re.compile(r"/(movies|tv|anime)/(\d+)(?:/|$)")
 SIMKL_ENDPOINTS = {"movies", "tv", "anime"}
@@ -73,31 +73,24 @@ class SyncStats:
 # Cache
 # -----------------------------------------------------------------------------
 
-
-def empty_cache() -> dict[str, Any]:
-    return {
-        "version": CACHE_VERSION,
-        "last_run": None,
-        "items": {},
-        "collections": {},
-    }
-
-
 def load_cache(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return empty_cache()
+    cache: dict[str, Any] = {}
 
-    try:
-        with path.open("r", encoding="utf-8") as file:
-            cache = json.load(file)
-    except (OSError, json.JSONDecodeError) as exc:
-        logging.warning("Unable to read cache %s: %s", path, exc)
-        return empty_cache()
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                loaded = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            logging.warning("Unable to read cache %s: %s", path, exc)
+            loaded = {}
 
-    if not isinstance(cache, dict):
-        logging.warning("Invalid cache root; rebuilding cache")
-        return empty_cache()
+        if isinstance(loaded, dict):
+            cache = loaded
+        else:
+            logging.warning("Invalid cache root; rebuilding cache")
+            cache = {}
 
+    cache.setdefault("version", CACHE_VERSION)
     cache.setdefault("last_run", None)
     cache.setdefault("items", {})
     cache.setdefault("collections", {})
@@ -110,13 +103,14 @@ def load_cache(path: Path) -> dict[str, Any]:
         logging.warning("Invalid collection cache; rebuilding it")
         cache["collections"] = {}
 
-    # Cache v6 and later uses a flat SIMKL record with one fetched_at value. Clear old SIMKL
-    # metadata and collection-order state once so the new layout is rebuilt.
+    cache["collections"].setdefault("last_sort_mode", None)
+
+    # Schema migration (if needed)
     if cache.get("version") != CACHE_VERSION:
         for entry in cache["items"].values():
             if isinstance(entry, dict):
                 entry.pop("simkl", None)
-        cache["collections"] = {}
+        cache["collections"] = {"last_sort_mode": None}
         logging.info("Cache schema changed; SIMKL metadata and collection order will rebuild")
 
     cache["version"] = CACHE_VERSION
@@ -627,7 +621,7 @@ def order_signature(items: Iterable[Any]) -> list[int]:
 
 def get_cached_order(cache: dict[str, Any], collection: Any) -> list[int] | None:
     record = cache["collections"].get(collection_cache_key(collection))
-    if not isinstance(record, dict) or record.get("sort_mode") != "simkl":
+    if not isinstance(record, dict):
         return None
 
     rating_keys = record.get("rating_keys")
@@ -639,10 +633,8 @@ def get_cached_order(cache: dict[str, Any], collection: Any) -> list[int] | None
     except (TypeError, ValueError):
         return None
 
-
 def store_order(cache: dict[str, Any], collection: Any, rating_keys: list[int]) -> None:
     cache["collections"][collection_cache_key(collection)] = {
-        "sort_mode": "simkl",
         "rating_keys": rating_keys,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -663,22 +655,34 @@ def simkl_sort_key(item: Any, cache: dict[str, Any]) -> tuple[bool, int, str]:
         getattr(item, "title", "").casefold(),
     )
 
+def get_last_sort_mode(cache: dict[str, Any]) -> str | None:
+    return cache["collections"].get("last_sort_mode")
+
+
+def set_last_sort_mode(cache: dict[str, Any], mode: str) -> None:
+    cache["collections"]["last_sort_mode"] = mode
 
 def sort_collection(
     collection: Any,
     mode: str,
     cache: dict[str, Any],
     dry_run: bool,
+    force_custom_mode: bool,
 ) -> tuple[bool, bool]:
-    """Return (was_reordered, was_skipped)."""
     if mode == "alpha":
         logging.info("Setting %s to alphabetical collection ordering", collection.title)
         if not dry_run:
             collection.sortUpdate("alpha")
         return True, False
 
+    if mode == "release":
+        logging.info("Setting %s to release-date collection ordering", collection.title)
+        if not dry_run:
+            collection.sortUpdate("release")
+        return True, False
+
     if mode != "simkl":
-        raise ValueError("COLLECTION_SORT must be 'alpha' or 'simkl'")
+        raise ValueError("COLLECTION_SORT must be 'alpha', 'release' or 'simkl'")
 
     collection_items = collection.items()
     desired_items = sorted(
@@ -686,12 +690,26 @@ def sort_collection(
         key=lambda item: simkl_sort_key(item, cache),
     )
     desired_order = order_signature(desired_items)
+    cached_order = get_cached_order(cache, collection)
 
-    if get_cached_order(cache, collection) == desired_order:
-        logging.info("%s SIMKL order unchanged (%d items); skipping Plex reorder", collection.title, len(desired_order))
+    if cached_order == desired_order:
+        if force_custom_mode and not dry_run:
+            logging.info("%s SIMKL order unchanged (%d items), switching sort mode back to custom", collection.title, len(desired_order))
+            collection.sortUpdate("custom")
+        elif force_custom_mode:
+            logging.info("%s SIMKL order unchanged (%d items), would switch sort mode to custom (dry-run)", collection.title, len(desired_order))
+        else:
+            logging.info("%s SIMKL order unchanged (%d items); skipping Plex reorder", collection.title, len(desired_order))
+
         return False, True
 
-    logging.info("Applying SIMKL custom order to %s (%d items)", collection.title, len(desired_order))
+    # Order changed: re-apply moves as before
+    logging.info(
+        "Applying SIMKL custom order to %s (%d items)",
+        collection.title,
+        len(desired_order),
+    )
+
     if dry_run:
         return False, False
 
@@ -723,7 +741,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-collection", default=DEFAULT_SHOW_COLLECTION_NAME)
     parser.add_argument("--movies-section", default=DEFAULT_MOVIES_SECTION)
     parser.add_argument("--shows-section", default=DEFAULT_SHOWS_SECTION)
-    parser.add_argument("--sort", dest="sort_mode", default=DEFAULT_COLLECTION_SORT, choices=("alpha", "simkl"))
+    parser.add_argument("--sort", dest="sort_mode", default=DEFAULT_COLLECTION_SORT, choices=("alpha", "release", "simkl"))
     parser.add_argument("--simkl-client-id", default=DEFAULT_SIMKL_CLIENT_ID)
     parser.add_argument("--simkl-app-name", default=DEFAULT_SIMKL_APP_NAME)
     parser.add_argument("--simkl-app-version", default=DEFAULT_SIMKL_APP_VERSION)
@@ -790,18 +808,28 @@ def main() -> None:
     if args.sort_mode == "simkl" and args.simkl_client_id:
         simkl_stats = populate_simkl_metadata(plex, cache, args)
 
+    last_mode = get_last_sort_mode(cache)
+    force_custom_mode = (
+        args.sort_mode == "simkl"
+        and last_mode in {"alpha", "release"}
+    )
+
     movie_reordered, movie_skipped = sort_collection(
         movie_collection,
         args.sort_mode,
         cache,
         args.dry_run,
+        force_custom_mode,
     )
     show_reordered, show_skipped = sort_collection(
         show_collection,
         args.sort_mode,
         cache,
         args.dry_run,
+        force_custom_mode,
     )
+
+    set_last_sort_mode(cache, args.sort_mode)
 
     stats = merge_stats(
         SyncStats(watchlist_items=len(watchlist)),
