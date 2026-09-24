@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 # Configuration
 # -----------------------------------------------------------------------------
 
-DEFAULT_CACHE_PATH = os.getenv("CACHE_PATH", "./plex-watchlist-cache.json")
+DEFAULT_CACHE_PATH = os.getenv("CACHE_PATH", "/data/plex-watchlist-cache.json")
 DEFAULT_MOVIE_COLLECTION_NAME = os.getenv("MOVIE_COLLECTION_NAME", "Films à voir")
 DEFAULT_SHOW_COLLECTION_NAME = os.getenv("SHOW_COLLECTION_NAME", "Séries à voir")
 DEFAULT_PLEX_BASE_URL = os.getenv("PLEX_BASE_URL", "https://plex.sample")
@@ -47,7 +47,7 @@ DEFAULT_SHOWS_SECTION = os.getenv("SHOWS_SECTION", "Séries TV")
 DEFAULT_COLLECTION_SORT = os.getenv("COLLECTION_SORT", "alpha").strip().lower()
 DEFAULT_SIMKL_CLIENT_ID = os.getenv("SIMKL_CLIENT_ID", "")
 DEFAULT_SIMKL_APP_NAME = os.getenv("SIMKL_APP_NAME", "Plex Discover Watchlist Sync")
-DEFAULT_SIMKL_APP_VERSION = os.getenv("SIMKL_APP_VERSION", "v0.4.0")
+DEFAULT_SIMKL_APP_VERSION = os.getenv("SIMKL_APP_VERSION", "v0.4.1")
 DEFAULT_SIMKL_CACHE_TTL = int(os.getenv("SIMKL_CACHE_TTL", "2592000"))
 DEFAULT_SIMKL_MAX_WORKERS = int(os.getenv("SIMKL_MAX_WORKERS", "6"))
 
